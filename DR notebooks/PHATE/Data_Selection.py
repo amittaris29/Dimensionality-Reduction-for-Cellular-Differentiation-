@@ -1,8 +1,8 @@
 import pandas as pd
 
-def data_selector(num_of_data):
+def data_selector(num_of_data, file):
     # Load CSV into a DataFrame
-    data = pd.read_csv('df_main.csv')
+    data = pd.read_csv(file)
     #Remove the unwanted columns
     numerical_data = data.drop(data.columns[[0,6,8]], axis=1) 
 
@@ -54,3 +54,4 @@ def data_selector(num_of_data):
 
     #DO phate to whole data set and then just color 
     return final_selected_data, combined_equal_data
+    

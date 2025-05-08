@@ -1,8 +1,8 @@
 import pandas as pd
 
-def data_selector(num_of_data, file):
+def data_selector(num_of_data):
     # Load CSV into a DataFrame
-    data = pd.read_csv(file)
+    data = pd.read_csv('df_main.csv')
     #Remove the unwanted columns
     numerical_data = data.drop(data.columns[[0,6,8]], axis=1) 
 

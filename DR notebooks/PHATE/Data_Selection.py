@@ -4,7 +4,7 @@ def data_selector(num_of_data, file):
     # Load CSV into a DataFrame
     data = pd.read_csv(file)
     #Remove the unwanted columns
-    numerical_data = data.drop(data.columns[[0,6,8]], axis=1) 
+    numerical_data = data.drop(data.columns[[0,6]], axis=1) 
 
 
     #Ensure only numerical data is used
@@ -50,7 +50,7 @@ def data_selector(num_of_data, file):
 
 
     #Selected data with not equal proportions in respect to timepoints
-    final_selected_data = combined_equal_data.drop(data.columns[7], axis=1) 
+    final_selected_data = combined_equal_data.drop(data.columns[[7, 8]], axis=1) 
 
     #DO phate to whole data set and then just color 
     return final_selected_data, combined_equal_data

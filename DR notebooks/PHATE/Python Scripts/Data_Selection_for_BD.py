@@ -2,7 +2,7 @@ import pandas as pd
 
 def data_selector_for_bd(num_of_data, df):
     # Ensure only gene expression columns are kept
-    gene_columns = ['TBX6', 'BRA', 'CDX2', 'SOX2', 'SOX1', 'timepoint']
+    gene_columns = ['TBX6', 'BRA', 'CDX2', 'SOX2', 'SOX1', 'timepoint', 'cluster_post_replacement']
     selected = df[gene_columns].copy()
 
     # Shuffle the full dataset to ensure randomness
@@ -20,7 +20,7 @@ def data_selector_for_bd(num_of_data, df):
     # Combine all equally sampled timepoint groups
     combined_equal_data = pd.concat(balanced_data, ignore_index=True)
 
-    # Final output with only the gene expression columns (drop timepoint)
-    final_selected_data = combined_equal_data.drop(columns='timepoint')
+    final_selected_data = combined_equal_data.drop(columns=['timepoint', 'cluster_post_replacement'])
+
 
     return final_selected_data, combined_equal_data

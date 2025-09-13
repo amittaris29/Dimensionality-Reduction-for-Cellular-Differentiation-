@@ -187,30 +187,70 @@ def trace_G(model, z, *, likelihood="gaussian", sigma_x=1.0, num_probe: int = 2,
     return scale * jnp.mean(vals)
 
 
-def gram_G(model, z, *, likelihood="gaussian", sigma_x=1.0):
+def gram_G(
+    model,
+    z,
+    *,
+    likelihood: str = "gaussian",
+    sigma_x: float = 1.0,
+    floor_mult: float = 1e-12,     # scale-aware eigen floor multiplier
+    use_float64_eigs: bool = True  # compute eigs/logdet in float64 for stability
+):
     """
-    Build the small d×d Gram G(z) = J^T J (scaled) and its logdet in a stable way.
-    Cost: d JVPs, fine when latent_dim d is small (e.g., <= 16).
+    Build the small d×d Gram G(z) = J^T J (scaled) and a *robust* logdet(G).
+
+    Numerical stabilizations:
+      - compute eigenvalues of G (symmetric PSD) via eigvalsh
+      - clip tiny *and* negative (roundoff) eigenvalues to
+            eps = floor_mult * (trace(G)/d + tiny)
+      - logdet = sum(log(clipped_eigs))
+      - optional float64 path for eigs/log
+
+    Args:
+        model: has .decode(z) -> x_hat
+        z: latent vector (d,)
+        likelihood: "gaussian" or "bernoulli_logits" (affects Fisher scaling)
+        sigma_x: obs std for Gaussian likelihood
+        floor_mult: eigenvalue floor as a fraction of mean eigenvalue
+        use_float64_eigs: do eig/log in float64 (recommended)
+
+    Returns:
+        G: (d,d) Gram matrix (same dtype as z)
+        logdet: scalar robust logdet(G) (same dtype as z)
     """
     d = z.shape[-1]
-    eye_d = jnp.eye(d)
+    eye_d = jnp.eye(d, dtype=z.dtype)
 
-    # Columns of J via JVP with basis vectors e_i
+    # J columns via JVPs with basis vectors e_i
     def col(ei):
         _, Jvi = jax.jvp(model.decode, (z,), (ei,))
-        return Jvi  # shape (D,)
+        return Jvi  # (D,)
 
-    J_cols = jax.vmap(col)(eye_d)       # (d, D)
-    J = jnp.transpose(J_cols, (1, 0))   # (D, d)
+    J_cols = jax.vmap(col)(eye_d)          # (d, D)
+    J = jnp.transpose(J_cols, (1, 0))      # (D, d)
 
-    G = J.T @ J                         # (d, d)
-    G = G * _metric_scale(likelihood, sigma_x)
+    scale = _metric_scale(likelihood, sigma_x)
+    G = (J.T @ J) * scale                  # (d, d), PSD (modulo roundoff)
 
-    # Stabilize and get logdet
-    epsI = 1e-8 * jnp.eye(d)
-    sign, logdet = jnp.linalg.slogdet(G + epsI)
-    logdet = jnp.where(sign > 0, logdet, -jnp.inf)
-    return G, logdet
+    # --- Robust logdet via eigenvalue flooring ---
+    # Work in float64 for eig/log if requested
+    G_eig = G.astype(jnp.float64) if use_float64_eigs else G
+
+    # Symmetric eigenvalues (ascending), may contain tiny negative roundoff
+    evals = jnp.linalg.eigvalsh(G_eig)     # (d,)
+
+    # Mean eigenvalue for scale-aware floor; add tiny to avoid zero
+    mean_eig = jnp.mean(evals)
+    eps = floor_mult * (mean_eig + jnp.finfo(G_eig.dtype).eps)
+
+    # Clip both negative/near-zero eigenvalues
+    evals_safe = jnp.clip(evals, a_min=eps)
+
+    logdet_val = jnp.sum(jnp.log(evals_safe))
+    if use_float64_eigs and (G.dtype != jnp.float64):
+        logdet_val = logdet_val.astype(G.dtype)
+
+    return G, logdet_val
 
 # Log-probability helpers
 # -----------------------------
@@ -350,10 +390,18 @@ def loss2_VAE(
         def _G_and_logdet(z_i):
             return gram_G(model, z_i, likelihood=likelihood, sigma_x=sigma_x)
         Gs, logdets = jax.vmap(_G_and_logdet, in_axes=0)(z_geo)  # Gs: (B,d,d); logdets: (B,)
-
+        
+        
         # -- (a) MF uniformity: minimize var(logdet G)
         mf_pen = jnp.var(logdets)
-        #print(mf_pen)
+        #jax.debug.print("mean logdet={x}", x=jnp.mean(logdets))
+        
+        # 1) Basic summary
+        #jax.debug.print(
+        #    "mean logdet={m}, frac_nonfinite={f}",
+        #    m=jnp.mean(jnp.where(jnp.isfinite(logdets), logdets, 0.0)),
+        #    f=jnp.mean((~jnp.isfinite(logdets)).astype(jnp.float32)),
+        #)
           
         # -- (b) Isometry (scale-invariant): || G/(tr(G)/d) - I ||_F^2
         d = mu.shape[-1]
@@ -362,7 +410,7 @@ def loss2_VAE(
         Gn = Gs / scale                                           # normalized
         iso_pen = jnp.mean(jnp.sum((Gn - jnp.eye(d)) ** 2, axis=(1, 2)))
 
-        geo_loss = lambda_iso * iso_pen + lambda_mf #* mf_pen 
+        geo_loss = lambda_iso * iso_pen + lambda_mf * mf_pen 
     else:
         geo_loss = 0.0
 
@@ -538,38 +586,41 @@ def evaluate(
     return res["avg_objective"], res["acc_thresh"]
 
             
+import jax
+import jax.numpy as jnp
+import optax
+import equinox as eqx
+import jax.tree_util as jtu
+
+def _global_norm(tree):
+    return optax.global_norm(tree)
+
+def _max_abs(tree):
+    # Max |value| across all array leaves; returns scalar
+    leaves = jtu.tree_leaves(eqx.filter(tree, eqx.is_array))
+    if len(leaves) == 0:
+        return jnp.array(0.0)
+    return jnp.max(jnp.stack([jnp.max(jnp.abs(x)) for x in leaves]))
+
 def train_VAE(
     model: eqx.Module,
-    loss_fn,                     # e.g., functools.partial(loss2_VAE, iwae=True/False, ...)
+    loss_fn,
     X,
-    Y=None,                      # unused here; kept for API symmetry
+    Y=None,
     *,
     steps: int = 1000,
     batch_size: int = 128,
     learning_rate: float = 1e-3,
     print_every: int = 100,
-    key: jax.random.PRNGKey,
-    eval_fn=None,                # callable taking (model) or (model, X, Y) — see below
-    grad_clip: float
+    key: jax.random.PRNGKey = None,
+    eval_fn=None,
+    grad_clip: float = None,
+    # ---- NEW: monitoring knobs ----
+    monitor_grads: bool = False,
+    explode_threshold: float = 1e6,      # tune to your scale
 ):
-    """
-    Generic Equinox + Optax trainer that works for both ELBO and IWAE objectives
-    (selected via the provided loss_fn).
-
-    - Proper shuffling each epoch (fresh RNG).
-    - Per-step PRNG split for stochastic reparameterization.
-    - Optional gradient clipping.
-    - Eval hook supports either eval_fn(model) or eval_fn(model, X, Y).
-
-    Returns:
-        Trained model (recombined from params + static).
-    """
-    # -----------------
-    # Setup
-    # -----------------
     key = key if key is not None else jax.random.PRNGKey(0)
 
-    # Ensure JAX arrays (and flatten images if you didn't already)
     X = jnp.array(X, dtype=jnp.float32)
     if X.ndim > 2:
         X = X.reshape(X.shape[0], -1)
@@ -577,74 +628,102 @@ def train_VAE(
     N = X.shape[0]
     steps_per_epoch = max(1, (N + batch_size - 1) // batch_size)
 
-    # Optimizer (with optional global-norm clipping)
     if grad_clip is not None:
-        optim = optax.chain(
-            optax.clip_by_global_norm(grad_clip),
-            optax.adamw(learning_rate),
-        )
+        optim = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adamw(learning_rate))
     else:
         optim = optax.adamw(learning_rate)
 
     params, static = eqx.partition(model, eqx.is_array)
     opt_state = optim.init(params)
 
-    # -----------------
-    # One JIT-compiled step
-    # -----------------
     @eqx.filter_jit
     def make_step(params, static, opt_state, x_batch, step_key):
+        # Compute loss and grads
         loss_value, grads = eqx.filter_value_and_grad(loss_fn)(params, static, x_batch, step_key)
+
+        # Compute gradient stats BEFORE clipping/updates
+        grad_norm = _global_norm(grads)
+        grad_max  = _max_abs(grads)
+
+        # Optimizer update
         updates, opt_state_ = optim.update(grads, opt_state, params)
         new_params = eqx.apply_updates(params, updates)
-        return new_params, opt_state_, loss_value
 
-    # -----------------
-    # Training loop
-    # -----------------
+        # Update stats (after transform)
+        upd_norm  = _global_norm(updates)
+        # Optional: parameter norm to gauge relative update size
+        param_norm = _global_norm(params)
+
+        # Finite checks
+        finite_flags = jnp.isfinite(jnp.array([loss_value, grad_norm, grad_max, upd_norm, param_norm]))
+        all_finite = jnp.all(finite_flags)
+
+        return new_params, opt_state_, loss_value, grad_norm, grad_max, upd_norm, param_norm, all_finite
+
     # initial permutation
     epoch = 0
     ek, key = jax.random.split(key)
     perm = jax.random.permutation(ek, N)
 
     for step in range(steps):
-        # Shuffle at epoch boundaries
         if step % steps_per_epoch == 0 and step > 0:
             epoch += 1
             ek, key = jax.random.split(key)
             perm = jax.random.permutation(ek, N)
 
-        # Slice current minibatch
         start = (step % steps_per_epoch) * batch_size
         end = min(start + batch_size, N)
         idx = perm[start:end]
         x_batch = X[idx]
 
-        # Per-step RNG for stochastic forward pass
         step_key, key = jax.random.split(key)
 
-        # Gradient step
-        params, opt_state, loss_val = make_step(params, static, opt_state, x_batch, step_key)
+        params, opt_state, loss_val, grad_norm, grad_max, upd_norm, param_norm, all_finite = make_step(
+            params, static, opt_state, x_batch, step_key
+        )
 
-        # Logging / Eval
-        if (step % print_every == 0) or (step == steps - 1):
-            msg = f"step={step:06d}  loss={float(loss_val):.4f}"
+        # Convert to Python floats for safe conditionals
+        loss_f = float(loss_val)
+        gnorm_f = float(grad_norm)
+        gmax_f = float(grad_max)
+        unorm_f = float(upd_norm)
+        pnorm_f = float(param_norm)
+        finite = bool(all_finite)
+
+        # Detect explosion/non-finite
+        exploded = (gnorm_f > explode_threshold) or (not finite)
+
+        if (step % print_every == 0) or (step == steps - 1) or exploded:
+            msg = f"step={step:06d} loss={loss_f:.4f}"
+            if monitor_grads:
+                rel_update = unorm_f / (pnorm_f + 1e-12)
+                msg += (f" | grad_norm={gnorm_f:.3e}"
+                        f" grad_max={gmax_f:.3e}"
+                        f" upd_norm={unorm_f:.3e}"
+                        f" param_norm={pnorm_f:.3e}"
+                        f" rel_upd={rel_update:.3e}")
+                if not finite:
+                    msg += "  [NON-FINITE DETECTED]"
+                if gnorm_f > explode_threshold:
+                    msg += f"  [EXPLODE: > {explode_threshold:.1e}]"
 
             if eval_fn is not None:
-                # Recombine for evaluation (no grad)
                 model_eval = eqx.combine(params, static)
-                # Support either eval_fn(model) or eval_fn(model, X, Y)
                 try:
                     eval_out = eval_fn(model_eval)
                 except TypeError:
                     eval_out = eval_fn(model_eval, X, Y)
-                # eval_out can be a scalar or dict; format sensibly
                 if isinstance(eval_out, dict):
                     parts = [f"{k}={float(v):.4f}" for k, v in eval_out.items() if jnp.ndim(v) == 0]
-                    msg += "  |  " + ", ".join(parts)
+                    msg += " | " + ", ".join(parts)
                 else:
-                    msg += f"  |  eval={float(eval_out):.4f}"
+                    msg += f" | eval={float(eval_out):.4f}"
 
             print(msg)
+
+        # Optional: abort early on explosion
+        if exploded:
+            print("Stopping early due to gradient explosion / non-finite values.")
+            break
 
     return eqx.combine(params, static)

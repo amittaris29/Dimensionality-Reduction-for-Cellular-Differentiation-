@@ -585,12 +585,6 @@ def evaluate(
     )
     return res["avg_objective"], res["acc_thresh"]
 
-            
-import jax
-import jax.numpy as jnp
-import optax
-import equinox as eqx
-import jax.tree_util as jtu
 
 def _global_norm(tree):
     return optax.global_norm(tree)

@@ -8,6 +8,7 @@ import jax.nn as jnn
 from typing import Any
 from typing import List
 from typing import Sequence, Optional, List, Callable, Tuple
+import jax.tree_util as jtu   # <- this is the “jtu” you’re calling
 
 
 class DeepVAE(eqx.Module):

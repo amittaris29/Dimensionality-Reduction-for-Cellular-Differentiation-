@@ -314,7 +314,7 @@ def loss2_VAE(
         if likelihood == "bernoulli_logits":
             recon_ll = _bernoulli_loglik_with_logits(x, xhat)  # (B,)
             recon_nll = -jnp.mean(recon_ll)
-        elif likelihood == "gaussian":
+        elif likelihood == "gaussian": #maybe yse higher dimensional gaussian 
             recon_ll = _gaussian_loglik(x, xhat, sigma_x)      # (B,)
             recon_nll = -jnp.mean(recon_ll)
         else:
